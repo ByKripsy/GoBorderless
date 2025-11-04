@@ -42,6 +42,16 @@ func intValidator(s string) error {
 	return nil
 }
 
+func offsetIntValidator(s string) error {
+	if s == "" {
+		return nil
+	}
+	if _, err := strconv.Atoi(s); err != nil {
+		return fmt.Errorf("invalid number")
+	}
+	return nil
+}
+
 var settingsList *widget.List
 
 var currentWindows = make([]Window, 0) // Temporary list to store window titles

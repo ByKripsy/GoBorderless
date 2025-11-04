@@ -1,6 +1,7 @@
 package main
 
 import (
+	_ "embed"
 	"fmt"
 	"reflect"
 	"slices"
@@ -29,6 +30,10 @@ var (
 	widthText         *widget.Entry
 	heightText        *widget.Entry
 	confirmButton     *widget.Button
+
+	halfLeftBtn  *widget.Button
+	halfRightBtn *widget.Button
+	fullBtn      *widget.Button
 )
 
 func isValid(isNew bool) bool {
@@ -71,46 +76,23 @@ func getWindowsForSelect(allWindows []Window) []Window {
 	// This will also filter out windows that we've already removed borders from
 	// Perhaps we should also check the list of existing configs?
 	for _, window := range allWindows {
-		style := getWindowStyle(window.hwnd)
-		if style&win.WS_CAPTION > 0 &&
-			((style&win.WS_BORDER) > 0 || (style&win.WS_THICKFRAME) > 0) {
+		if isValidWindowForSelection(window) {
 			copyOfWindows = append(copyOfWindows, window)
 		}
 	}
-	slices.SortFunc(copyOfWindows, func(a Window, b Window) int {
+	slices.SortFunc(copyOfWindows, func(a, b Window) int {
 		return strings.Compare(strings.ToLower(a.String()), strings.ToLower(b.String()))
 	})
 	return copyOfWindows
 }
 
-func makeAppSettingWindow(settings *Settings, appSetting AppSetting, isNew bool, parent fyne.Window, onClose func(newSetting *AppSetting)) *dialog.CustomDialog {
-	currentWindowsMutex.Lock()
-	windowsForSelect := getWindowsForSelect(currentWindows)
-	currentWindowsMutex.Unlock()
+func isValidWindowForSelection(window Window) bool {
+	style := getWindowStyle(window.hwnd)
+	return style&win.WS_CAPTION > 0 &&
+		((style&win.WS_BORDER) > 0 || (style&win.WS_THICKFRAME) > 0)
+}
 
-	var appSettingDialog *dialog.CustomDialog
-	var windowSub rx.Subscription
-
-	confirmButton = widget.NewButtonWithIcon("Create", theme.ConfirmIcon(), func() {
-		if isNew {
-			windowSub.Unsubscribe()
-		}
-		appSettingDialog.Hide()
-		onClose(&appSetting)
-	})
-	confirmButton.Importance = widget.HighImportance
-	confirmButton.Disable()
-	cancelButton := widget.NewButtonWithIcon("Cancel", theme.CancelIcon(), func() {
-		if isNew {
-			windowSub.Unsubscribe()
-		}
-		appSettingDialog.Hide()
-		onClose(nil)
-	})
-	if !isNew {
-		confirmButton.SetText("Save")
-	}
-
+func createApplicationSelect(windowsForSelect []Window, appSetting *AppSetting, isNew bool) *ui.Select[Window] {
 	applicationSelect = ui.NewSelect(windowsForSelect, func(selected Window) {
 		if slices.Index(windowsForSelect, selected) == -1 {
 			fmt.Println("Selected application no longer exists in the updated window list, resetting selection.")
@@ -125,26 +107,40 @@ func makeAppSettingWindow(settings *Settings, appSetting AppSetting, isNew bool,
 	})
 	applicationSelect.PlaceHolder = "Select Application"
 
-	monitorIdx := appSetting.Monitor - 1
-	if isNew {
-		monitorIdx = settings.Defaults.Monitor - 1
-		if monitorIdx < 0 {
-			monitorIdx = slices.IndexFunc(monitors, func(m Monitor) bool {
-				return m.isPrimary
-			})
-		}
+	return applicationSelect
+}
+
+func getDefaultMonitorIndex(settings *Settings, appSetting AppSetting, isNew bool) int {
+	if !isNew {
+		return appSetting.Monitor - 1
 	}
+
+	monitorIdx := settings.Defaults.Monitor - 1
+	if monitorIdx < 0 {
+		monitorIdx = slices.IndexFunc(monitors, func(m Monitor) bool {
+			return m.isPrimary
+		})
+	}
+
+	return monitorIdx
+}
+
+func createDisplaySelect(settings *Settings, appSetting *AppSetting, isNew bool) *ui.Select[Monitor] {
+	monitorIdx := getDefaultMonitorIndex(settings, *appSetting, isNew)
+
 	displaySelect = ui.NewSelect(monitors, func(selected Monitor) {
 		appSetting.Monitor = selected.number
-
 		setConfirmButtonState(isNew)
 	})
 	displaySelect.PlaceHolder = "Select Display"
 	displaySelect.SetSelectedIndex(monitorIdx)
 
+	return displaySelect
+}
+
+func createMatchTypeRadio(settings *Settings, appSetting *AppSetting, isNew bool) *widget.RadioGroup {
 	matchType = widget.NewRadioGroup(matchTypes, func(selected string) {
 		appSetting.MatchType = GetMatchTypeFromString(selected)
-
 		setConfirmButtonState(isNew)
 	})
 	if isNew {
@@ -155,89 +151,101 @@ func makeAppSettingWindow(settings *Settings, appSetting AppSetting, isNew bool,
 	matchType.Horizontal = true
 	matchType.Required = true
 
-	// Textboxes with labels
-	xOffsetLabel := widget.NewLabel("X Offset:")
-	xOffsetText = widget.NewEntry()
-	xOffsetText.Validator = intValidator
-	xOffsetText.OnChanged = func(s string) {
-		appSetting.OffsetX = entryTextToInt(s)
+	return matchType
+}
 
+func createSizeButton(monitor Monitor, xDivider int32, xOffset int32, label string, icon fyne.Resource) *widget.Button {
+	monitorWidth := monitor.width / xDivider
+	offsetWidth := int32(0)
+	if xOffset == 1 {
+		offsetWidth = monitorWidth
+	}
+
+	return widget.NewButtonWithIcon(label, icon, func() {
+		widthText.SetText(strconv.Itoa(int(monitorWidth)))
+		heightText.SetText(strconv.Itoa(int(monitor.height)))
+		xOffsetText.SetText(strconv.Itoa(int(offsetWidth)))
+		yOffsetText.SetText("0")
+	})
+}
+
+func createOffsetEntry(label string, defaultValue int32, settings *Settings, appSetting *AppSetting, isNew bool, updateField func(int32)) (*widget.Label, *widget.Entry) {
+	labelWidget := widget.NewLabel(label)
+
+	entry := widget.NewEntry()
+	entry.Validator = offsetIntValidator
+	entry.OnChanged = func(s string) {
+		if s == "" {
+			updateField(0)
+		} else {
+			updateField(entryTextToInt(s))
+		}
 		setConfirmButtonState(isNew)
 	}
-	setOnFocusChanged(xOffsetText, func(focused bool) {
+	setOnFocusChanged(entry, func(focused bool) {
 		if focused {
-			xOffsetText.DoubleTapped(&fyne.PointEvent{})
+			entry.DoubleTapped(&fyne.PointEvent{})
 		}
 	})
-	xOffsetText.SetPlaceHolder("0")
+
+	entry.SetPlaceHolder("0")
 	if isNew {
-		xOffsetText.SetText(strconv.Itoa(int(settings.Defaults.OffsetX)))
+		entry.SetText(strconv.Itoa(int(defaultValue)))
 	} else {
-		xOffsetText.SetText(strconv.Itoa(int(appSetting.OffsetX)))
+		entry.SetText(strconv.Itoa(int(defaultValue)))
 	}
 
-	yOffsetLabel := widget.NewLabel("Y Offset:")
-	yOffsetText = widget.NewEntry()
-	yOffsetText.Validator = intValidator
-	yOffsetText.OnChanged = func(s string) {
-		appSetting.OffsetY = entryTextToInt(s)
+	return labelWidget, entry
+}
 
+func createSizeEntry(label string, placeholder string, defaultValue int32, settings *Settings, appSetting *AppSetting, isNew bool, updateField func(int32)) (*widget.Label, *widget.Entry) {
+	labelWidget := widget.NewLabel(label)
+
+	entry := widget.NewEntry()
+	entry.Validator = intValidator
+	entry.OnChanged = func(s string) {
+		updateField(entryTextToInt(s))
 		setConfirmButtonState(isNew)
 	}
-	setOnFocusChanged(yOffsetText, func(focused bool) {
+
+	setOnFocusChanged(entry, func(focused bool) {
 		if focused {
-			yOffsetText.DoubleTapped(&fyne.PointEvent{})
+			entry.DoubleTapped(&fyne.PointEvent{})
 		}
 	})
-	yOffsetText.SetPlaceHolder("0")
+
+	entry.SetPlaceHolder(placeholder)
 	if isNew {
-		yOffsetText.SetText(strconv.Itoa(int(settings.Defaults.OffsetY)))
+		entry.SetText(strconv.Itoa(int(defaultValue)))
 	} else {
-		yOffsetText.SetText(strconv.Itoa(int(appSetting.OffsetY)))
+		entry.SetText(strconv.Itoa(int(defaultValue)))
 	}
 
-	widthLabel := widget.NewLabel("Width:")
-	widthText = widget.NewEntry()
-	widthText.Validator = intValidator
-	widthText.OnChanged = func(s string) {
-		appSetting.Width = entryTextToInt(s)
+	return labelWidget, entry
+}
 
-		setConfirmButtonState(isNew)
-	}
-	setOnFocusChanged(widthText, func(focused bool) {
-		if focused {
-			widthText.DoubleTapped(&fyne.PointEvent{})
-		}
+func createTextGrid(settings *Settings, appSetting *AppSetting, isNew bool) *fyne.Container {
+	xOffsetLabel, xOffsetEntry := createOffsetEntry("X Offset:", settings.Defaults.OffsetX, settings, appSetting, isNew, func(val int32) {
+		appSetting.OffsetX = val
 	})
-	widthText.SetPlaceHolder("1920")
-	if isNew {
-		widthText.SetText(strconv.Itoa(int(settings.Defaults.Width)))
-	} else {
-		widthText.SetText(strconv.Itoa(int(appSetting.Width)))
-	}
+	xOffsetText = xOffsetEntry
 
-	heightLabel := widget.NewLabel("Height:")
-	heightText = widget.NewEntry()
-	heightText.Validator = intValidator
-	heightText.OnChanged = func(s string) {
-		appSetting.Height = entryTextToInt(s)
-
-		setConfirmButtonState(isNew)
-	}
-	setOnFocusChanged(heightText, func(focused bool) {
-		if focused {
-			heightText.DoubleTapped(&fyne.PointEvent{})
-		}
+	yOffsetLabel, yOffsetEntry := createOffsetEntry("Y Offset:", settings.Defaults.OffsetY, settings, appSetting, isNew, func(val int32) {
+		appSetting.OffsetY = val
 	})
-	heightText.SetPlaceHolder("1080")
-	if isNew {
-		heightText.SetText(strconv.Itoa(int(settings.Defaults.Height)))
-	} else {
-		heightText.SetText(strconv.Itoa(int(appSetting.Height)))
-	}
+	yOffsetText = yOffsetEntry
 
-	// 2x2 grid for labeled textboxes
-	textGrid := container.NewGridWithRows(2,
+	widthLabel, widthEntry := createSizeEntry("Width:", "1920", settings.Defaults.Width, settings, appSetting, isNew, func(val int32) {
+		appSetting.Width = val
+	})
+	widthText = widthEntry
+
+	heightLabel, heightEntry := createSizeEntry("Height:", "1080", settings.Defaults.Height, settings, appSetting, isNew, func(val int32) {
+		appSetting.Height = val
+	})
+	heightText = heightEntry
+
+	return container.NewGridWithRows(2,
 		container.NewGridWithColumns(2,
 			container.NewVBox(xOffsetLabel, xOffsetText),
 			container.NewVBox(yOffsetLabel, yOffsetText),
@@ -247,39 +255,120 @@ func makeAppSettingWindow(settings *Settings, appSetting AppSetting, isNew bool,
 			container.NewVBox(heightLabel, heightText),
 		),
 	)
+}
 
-	if isNew {
-		fmt.Println("subscribing to windows observable")
-		// TODO: make it work like subject where it outputs last received data on subscription
-
-		windowSub = windowObs.Subscribe(func(windows []Window) {
-			if len(windows) == 0 {
-				// This is probably a fluke, so let's skip it
-				return
-			}
-			fyne.Do(func() {
-				windowsForSelect = getWindowsForSelect(windows)
-				applicationSelect.SetOptions(windowsForSelect)
-
-				if applicationSelect.Selected != nil && slices.Index(windowsForSelect, *applicationSelect.Selected) == -1 {
-					fmt.Println("Selected application no longer exists in the updated window list, resetting selection.")
-					applicationSelect.ClearSelected()
-				}
-			})
-		})
+func subscribeToWindowUpdates(windowsForSelect []Window, isNew bool) rx.Subscription {
+	if !isNew {
+		return rx.Subscription{}
 	}
+
+	fmt.Println("subscribing to windows observable")
+	// TODO: make it work like subject where it outputs last received data on subscription
+
+	return windowObs.Subscribe(func(windows []Window) {
+		if len(windows) == 0 {
+			// This is probably a fluke, so let's skip it
+			return
+		}
+
+		fyne.Do(func() {
+			windowsForSelect = getWindowsForSelect(windows)
+			applicationSelect.SetOptions(windowsForSelect)
+
+			if applicationSelect.Selected != nil && slices.Index(windowsForSelect, *applicationSelect.Selected) == -1 {
+				fmt.Println("Selected application no longer exists in the updated window list, resetting selection.")
+				applicationSelect.ClearSelected()
+			}
+		})
+	})
+}
+
+func createPresetsContent(settings *Settings, appSetting *AppSetting, isNew bool, cancelButton, confirmBtn *widget.Button) *fyne.Container {
+	presetsRow := container.NewCenter(
+		container.NewHBox(
+			halfLeftBtn,
+			widget.NewLabel("   "),
+			halfRightBtn,
+			widget.NewLabel("   "),
+			fullBtn,
+		),
+	)
 
 	content := container.NewVBox(
 		displaySelect,
 		widget.NewLabel("Match Type"),
 		matchType,
-		textGrid,
+		widget.NewLabel("Presets:"),
+		presetsRow,
+		createTextGrid(settings, appSetting, isNew),
 		widget.NewLabel(""), // spacer
-		container.NewHBox(cancelButton, layout.NewSpacer(), confirmButton),
+		container.NewHBox(cancelButton, layout.NewSpacer(), confirmBtn),
 	)
+
 	if isNew {
 		content.Objects = append([]fyne.CanvasObject{applicationSelect}, content.Objects...)
 	}
+
+	return content
+}
+
+//go:embed assets/fullscreen.svg
+var fullscreenSVGBytes []byte
+
+//go:embed assets/halfleft.svg
+var halfLeftSVGBytes []byte
+
+//go:embed assets/halfright.svg
+var halfRightSVGBytes []byte
+
+func makeAppSettingWindow(settings *Settings, appSetting AppSetting, isNew bool, parent fyne.Window, onClose func(newSetting *AppSetting)) *dialog.CustomDialog {
+	currentWindowsMutex.Lock()
+	windowsForSelect := getWindowsForSelect(currentWindows)
+	currentWindowsMutex.Unlock()
+
+	var appSettingDialog *dialog.CustomDialog
+	var windowSub rx.Subscription
+
+	leftIcon := fyne.NewStaticResource("right.svg", halfLeftSVGBytes)
+	rightIcon := fyne.NewStaticResource("right.svg", halfRightSVGBytes)
+	fullIcon := fyne.NewStaticResource("full.svg", fullscreenSVGBytes)
+
+	monitorIdx := getDefaultMonitorIndex(settings, appSetting, isNew)
+	selectedMonitor := monitors[monitorIdx]
+
+	halfLeftBtn = createSizeButton(selectedMonitor, 2, 0, "Half Left", leftIcon)
+	halfRightBtn = createSizeButton(selectedMonitor, 2, 1, "Half Right", rightIcon)
+	fullBtn = createSizeButton(selectedMonitor, 1, 0, "Full", fullIcon)
+
+	confirmButton = widget.NewButtonWithIcon("Create", theme.ConfirmIcon(), func() {
+		if isNew {
+			windowSub.Unsubscribe()
+		}
+		appSettingDialog.Hide()
+		onClose(&appSetting)
+	})
+	confirmButton.Importance = widget.HighImportance
+	confirmButton.Disable()
+
+	if !isNew {
+		confirmButton.SetText("Save")
+	}
+
+	cancelButton := widget.NewButtonWithIcon("Cancel", theme.CancelIcon(), func() {
+		if isNew {
+			windowSub.Unsubscribe()
+		}
+		appSettingDialog.Hide()
+		onClose(nil)
+	})
+
+	applicationSelect = createApplicationSelect(windowsForSelect, &appSetting, isNew)
+	displaySelect = createDisplaySelect(settings, &appSetting, isNew)
+	matchType = createMatchTypeRadio(settings, &appSetting, isNew)
+
+	windowSub = subscribeToWindowUpdates(windowsForSelect, isNew)
+
+	content := createPresetsContent(settings, &appSetting, isNew, cancelButton, confirmButton)
 
 	dialogName := "New App Config"
 	if !isNew {

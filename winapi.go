@@ -107,24 +107,73 @@ func (m Monitor) String() string {
 	if m.isPrimary {
 		str += " (Primary)"
 	}
+	str += fmt.Sprintf(" | %dx%d", m.width, m.height)
 	return str
+}
+
+var (
+	procEnumDisplaySettingsW = user32.NewProc("EnumDisplaySettingsW")
+)
+
+type DEVMODE struct {
+	DmDeviceName         [32]uint16
+	DmSpecVersion        uint16
+	DmDriverVersion      uint16
+	DmSize               uint16
+	DmDriverExtra        uint16
+	DmFields             uint32
+	DmPosition           struct{ X, Y int32 }
+	DmDisplayOrientation uint32
+	DmDisplayFixedOutput uint32
+	DmColor              int16
+	DmDuplex             int16
+	DmYResolution        int16
+	DmTTOption           int16
+	DmCollate            int16
+	DmFormName           [32]uint16
+	DmLogPixels          uint16
+	DmBitsPerPel         uint32
+	DmPelsWidth          uint32
+	DmPelsHeight         uint32
 }
 
 func getMonitors() []Monitor {
 	var monitors []Monitor
 	index := 0
+
 	cb := syscall.NewCallback(func(hMonitor win.HMONITOR, hdcMonitor win.HDC, lprcMonitor *win.RECT, dwData uintptr) uintptr {
-		var info win.MONITORINFO
-		info.CbSize = uint32(unsafe.Sizeof(info))
-		if win.GetMonitorInfo(hMonitor, &info) {
+		var infoEx struct {
+			win.MONITORINFO
+			SzDevice [win.CCHDEVICENAME]uint16
+		}
+		infoEx.CbSize = uint32(unsafe.Sizeof(infoEx))
+
+		if win.GetMonitorInfo(hMonitor, (*win.MONITORINFO)(unsafe.Pointer(&infoEx))) {
+			var devMode DEVMODE
+			devMode.DmSize = uint16(unsafe.Sizeof(devMode))
+
+			ret, _, _ := procEnumDisplaySettingsW.Call(
+				uintptr(unsafe.Pointer(&infoEx.SzDevice[0])),
+				uintptr(0xFFFFFFFF),
+				uintptr(unsafe.Pointer(&devMode)),
+			)
+
+			width := int32(devMode.DmPelsWidth)
+			height := int32(devMode.DmPelsHeight)
+
+			if ret == 0 || width == 0 || height == 0 {
+				width = infoEx.RcMonitor.Right - infoEx.RcMonitor.Left
+				height = infoEx.RcMonitor.Bottom - infoEx.RcMonitor.Top
+			}
+
 			index++
 			monitors = append(monitors, Monitor{
 				number:    index,
-				isPrimary: info.DwFlags&win.MONITORINFOF_PRIMARY != 0,
-				width:     info.RcMonitor.Right - info.RcMonitor.Left,
-				height:    info.RcMonitor.Bottom - info.RcMonitor.Top,
-				left:      info.RcMonitor.Left,
-				top:       info.RcMonitor.Top,
+				isPrimary: infoEx.DwFlags&win.MONITORINFOF_PRIMARY != 0,
+				width:     width,
+				height:    height,
+				left:      infoEx.RcMonitor.Left,
+				top:       infoEx.RcMonitor.Top,
 			})
 		}
 		return 1
